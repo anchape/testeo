@@ -1,0 +1,7 @@
+.env
+datos.csv
+evidencia/
+__pycache__/
+*.pyc
+.venv/
+venv/
