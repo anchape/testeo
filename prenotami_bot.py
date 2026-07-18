@@ -78,11 +78,14 @@ SEL = {
     ],
 }
 
-# Textos (en it/en/es) con los que Prenot@Mi avisa que no hay turnos
+# Textos (en it/en/es) con los que Prenot@Mi avisa que no hay turnos.
+# El texto real verificado en la sede de Montevideo (hidden #WlNotAvailable):
+# "Sorry, all appointments for this service are currently booked. Please check
+#  again tomorrow for cancellations or new appointments."
 SIN_DISPONIBILIDAD = [
-    "non ci sono disponibilit",       # "Al momento non ci sono disponibilità"
     "all appointments for this service are currently booked",
     "sorry, all appointments",
+    "non ci sono disponibilit",       # "Al momento non ci sono disponibilità"
     "no hay disponibilidad",
     "posti esauriti",
 ]
@@ -187,17 +190,44 @@ def login(page: Page, cfg: Config) -> None:
     screenshot(page, cfg, "02-logueado")
 
 
+def cerrar_modales(page: Page) -> None:
+    """Cierra modales jquery-confirm (el 'OK' del aviso de sin turnos, etc.)."""
+    try:
+        botones = page.locator(".jconfirm-buttons button")
+        if botones.count() and botones.first.is_visible():
+            botones.first.click()
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
 def hay_disponibilidad(page: Page, cfg: Config) -> bool:
-    """Abre la página de reserva y devuelve True si cargó el formulario."""
+    """Abre la página de reserva y devuelve True si cargó el formulario.
+
+    Comportamiento verificado del sitio: si no hay turnos, el servidor
+    redirige a /Services, deja el mensaje en el hidden #WlNotAvailable y lo
+    muestra en un modal jquery-confirm.
+    """
     url = f"{SERVICES_URL}/Booking/{cfg.service_id}"
     page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(2_500)  # dar tiempo al posible modal de "sin turnos"
+    page.wait_for_timeout(2_000)  # dar tiempo al posible modal de "sin turnos"
+
+    # Rebote a /Services => sin turnos
+    if re.search(r"/Services/?$", page.url):
+        aviso = page.locator("#WlNotAvailable")
+        if aviso.count():
+            try:
+                msg = aviso.first.input_value()
+                if msg:
+                    log(f"Mensaje del sitio: {msg[:100]}")
+            except Exception:
+                pass
+        cerrar_modales(page)
+        return False
 
     cuerpo = normalizar(page.inner_text("body"))
     if any(patron in cuerpo for patron in SIN_DISPONIBILIDAD):
-        return False
-    # Si nos rebotó a /Services también significa que no había turnos
-    if re.search(r"/Services/?$", page.url):
+        cerrar_modales(page)
         return False
     return True
 

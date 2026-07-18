@@ -29,9 +29,18 @@ playwright install chromium
 
 1. Copiá `.env.example` a `.env` y completá:
    - `PRENOTAMI_EMAIL` / `PRENOTAMI_PASSWORD`: tu cuenta de Prenot@Mi.
-   - `SERVICE_ID`: entrá logueado a **Reservar** (Prenota) sobre el servicio de
-     ciudadanía; la URL queda `https://prenotami.esteri.it/Services/Booking/<ID>`.
-     Ese número es el `SERVICE_ID`.
+   - `SERVICE_ID`: ya viene con `5679`, el servicio de **Cittadinanza per
+     discendenza maggiorenni (L. 74/2025)** de la sede de Montevideo
+     (verificado contra la página real en 07/2026). Otros servicios de la sede:
+
+     | ID   | Servicio |
+     |------|----------|
+     | 5679 | Ciudadanía por descendencia — mayores (L. 74/2025) |
+     | 5896 | Ciudadanía hijos menores (turnos a partir de 06/2026) |
+     | 5126 | Pasaporte |
+     | 5199 | Cédula de identidad electrónica (CIE) |
+     | 5322 | Estado civil (matrimonio, divorcio, defunción) |
+     | 4947 | Legalización de traducciones |
 2. Copiá `datos.ejemplo.csv` a `datos.csv` y cargá tus datos. Cada fila es
    `campo,valor`, donde `campo` es el texto de la etiqueta tal como se ve en el
    formulario (no hace falta que sea exacto: la comparación ignora mayúsculas,
