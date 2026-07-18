@@ -56,6 +56,28 @@ Numero di persone,1
 > con `HEADLESS=false` cuando haya disponibilidad, o mirá el screenshot
 > `03-formulario` en `evidencia/`.
 
+## El flujo real de reserva (y cómo lo cubre el bot)
+
+Según la documentación pública del sistema, al reservar ciudadanía el flujo es:
+
+1. **Tipo de reserva** (individual / múltiple) y formulario de datos
+   → el bot lo completa desde `datos.csv` (fila `Tipo de reserva,Individual`).
+2. **Subida de documentos** — Prenot@Mi solo acepta **PDF** (no JPG/PNG)
+   → si una fila del CSV apunta a una ruta de archivo, el bot lo sube.
+3. **Calendario**: días **verdes** = disponibles, rojos = no; al elegir día se
+   abre la lista de horarios al costado → el bot toma el primero de ambos.
+4. **Código OTP**: al confirmar, llega un código numérico por email que hay
+   que ingresar para finalizar → ver sección siguiente.
+5. Email final de confirmación con los datos del turno.
+
+### OTP automático
+
+Si configurás `IMAP_USER`/`IMAP_PASSWORD` en el `.env` (para Gmail: una
+[contraseña de aplicación](https://myaccount.google.com/apppasswords), nunca tu
+password real), el bot espera el email de `esteri.it`, extrae el código y lo
+ingresa solo. Si no, te lo pide por consola: tenés que estar mirando la
+terminal en ese momento, porque el turno no se confirma sin el código.
+
 ## Uso
 
 ```bash
@@ -66,6 +88,10 @@ El bot queda reintentando cada `CHECK_INTERVAL_SECONDS` (más un jitter
 aleatorio) hasta encontrar turno. Al confirmar, Prenot@Mi te envía por email el
 comprobante en PDF — revisalo siempre: **la fuente de verdad es ese email**, no
 el log del bot.
+
+> **Después de conseguir el turno**: entre 10 y 3 días antes de la fecha tenés
+> que entrar a **Mis reservas** y confirmar tu asistencia, o el turno se
+> pierde. Eso el bot no lo hace: anotalo en tu calendario.
 
 ### Tip: cuándo correrlo
 

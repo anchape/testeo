@@ -19,6 +19,9 @@ visibles, para no caer en campos-trampa (honeypots) ocultos.
 """
 
 import csv
+import email as email_lib
+import email.policy
+import imaplib
 import os
 import random
 import re
@@ -70,6 +73,8 @@ SEL = {
         "input[type=radio]:not([disabled])",
     ],
     "privacy_check": "#PrivacyCheck, input[name='PrivacyCheck'], input[type=checkbox][id*='rivacy']",
+    # Campo del código OTP que llega por email al confirmar la reserva
+    "otp_input": "input[name*='otp' i], input[id*='otp' i], input[name*='codice' i], input[id*='codice' i]",
     "confirmar": [
         "#btnPrenotaNoOtp",
         "button#btnPrenota",
@@ -136,6 +141,12 @@ class Config:
         self.csv_datos = os.getenv("CSV_DATOS", "datos.csv")
         self.evidencia_dir = Path(os.getenv("EVIDENCIA_DIR", "evidencia"))
         self.max_meses = int(os.getenv("MAX_MESES_CALENDARIO", "8"))
+        # OTP por IMAP (opcional): si no se configura, el código se pide por consola
+        self.imap_host = os.getenv("IMAP_HOST", "imap.gmail.com")
+        self.imap_user = os.getenv("IMAP_USER", "")
+        self.imap_password = os.getenv("IMAP_PASSWORD", "")
+        self.imap_from = os.getenv("IMAP_FROM", "esteri.it")
+        self.otp_timeout = int(os.getenv("OTP_TIMEOUT_SECONDS", "240"))
 
         faltan = [
             nombre
@@ -265,16 +276,23 @@ def llenar_formulario(page: Page, cfg: Config, datos: dict[str, str]) -> None:
         # input/select/textarea dentro del mismo contenedor.
         control = None
         for_attr = label.get_attribute("for")
+        def _usable(loc) -> bool:
+            if not loc.count():
+                return False
+            # Los input[type=file] suelen estar ocultos tras botones estilizados
+            es_file = (loc.first.get_attribute("type") or "").lower() == "file"
+            return es_file or loc.first.is_visible()
+
         if for_attr:
             id_escapado = re.sub(r"([^a-zA-Z0-9_-])", r"\\\1", for_attr)
             candidato = page.locator(f"#{id_escapado}")
-            if candidato.count() and candidato.first.is_visible():
+            if _usable(candidato):
                 control = candidato.first
         if control is None:
             candidato = label.locator(
                 "xpath=following::*[self::input or self::select or self::textarea][1]"
             )
-            if candidato.count() and candidato.first.is_visible():
+            if _usable(candidato):
                 control = candidato.first
         if control is None:
             log(f"  ! No encontré el control para la etiqueta '{texto}'")
@@ -284,7 +302,17 @@ def llenar_formulario(page: Page, cfg: Config, datos: dict[str, str]) -> None:
         tipo = (control.get_attribute("type") or "").lower()
 
         try:
-            if tag == "select":
+            if tipo == "file":
+                # El valor del CSV debe ser la ruta a un archivo (Prenot@Mi
+                # solo acepta PDF, no imágenes)
+                ruta = Path(valor).expanduser()
+                if not ruta.exists():
+                    log(f"  ! Archivo no encontrado para '{texto}': {ruta}")
+                    continue
+                if ruta.suffix.lower() != ".pdf":
+                    log(f"  ! Aviso: Prenot@Mi solo acepta PDF y '{ruta.name}' no lo es.")
+                control.set_input_files(str(ruta))
+            elif tag == "select":
                 # Intentar por texto visible de la opción; si no, por value
                 try:
                     control.select_option(label=valor)
@@ -372,6 +400,90 @@ def elegir_primer_horario(page: Page) -> bool:
     return False
 
 
+def _texto_de_email(msg) -> str:
+    partes = []
+    if msg.is_multipart():
+        for parte in msg.walk():
+            if parte.get_content_type() in ("text/plain", "text/html"):
+                try:
+                    partes.append(parte.get_content())
+                except Exception:
+                    pass
+    else:
+        try:
+            partes.append(msg.get_content())
+        except Exception:
+            pass
+    return "\n".join(str(p) for p in partes)
+
+
+def buscar_otp_imap(cfg: Config) -> str | None:
+    """Busca en el inbox un email reciente NO LEÍDO de esteri.it con el código."""
+    try:
+        m = imaplib.IMAP4_SSL(cfg.imap_host)
+        m.login(cfg.imap_user, cfg.imap_password)
+        m.select("INBOX")
+        typ, data = m.search(None, f'(UNSEEN FROM "{cfg.imap_from}")')
+        ids = data[0].split() if typ == "OK" and data and data[0] else []
+        for num in reversed(ids):  # el más nuevo primero
+            typ, msg_data = m.fetch(num, "(RFC822)")
+            if typ != "OK":
+                continue
+            msg = email_lib.message_from_bytes(
+                msg_data[0][1], policy=email.policy.default
+            )
+            cuerpo = _texto_de_email(msg)
+            hit = re.search(r"\b(\d{6,10})\b", cuerpo)
+            if hit:
+                m.logout()
+                return hit.group(1)
+        m.logout()
+    except Exception as e:
+        log(f"IMAP: no pude leer el email ({e}).")
+    return None
+
+
+def obtener_otp(cfg: Config) -> str:
+    if cfg.imap_user and cfg.imap_password:
+        log(f"Esperando el email con el OTP en {cfg.imap_user} (via IMAP)...")
+        limite = time.time() + cfg.otp_timeout
+        while time.time() < limite:
+            codigo = buscar_otp_imap(cfg)
+            if codigo:
+                log(f"OTP leído del email: {codigo}")
+                return codigo
+            time.sleep(10)
+        log("No llegó el OTP por IMAP dentro del tiempo límite.")
+    # Fallback manual: el usuario lo lee de su email y lo tipea en la consola
+    return input(">> Ingresá el código OTP que recibiste por email y apretá Enter: ").strip()
+
+
+def manejar_otp(page: Page, cfg: Config) -> None:
+    """Si el sitio pide el código OTP del email, lo consigue y lo envía."""
+    otp = page.locator(SEL["otp_input"])
+    visible = False
+    for i in range(otp.count()):
+        if otp.nth(i).is_visible():
+            otp = otp.nth(i)
+            visible = True
+            break
+    if not visible:
+        log("No apareció campo de OTP (este servicio no lo pide o ya se confirmó).")
+        return
+
+    log("El sitio pide el código OTP enviado a tu email.")
+    screenshot(page, cfg, "05b-pide-otp")
+    codigo = obtener_otp(cfg)
+    otp.click()
+    page.keyboard.type(codigo, delay=random.randint(40, 90))
+    for sel in ["#btnPrenotaOtp"] + SEL["confirmar"]:
+        btn = page.locator(sel)
+        if btn.count() and btn.first.is_visible():
+            btn.first.click()
+            log("OTP enviado.")
+            break
+
+
 def confirmar(page: Page, cfg: Config) -> None:
     privacy = page.locator(SEL["privacy_check"])
     if privacy.count():
@@ -390,6 +502,10 @@ def confirmar(page: Page, cfg: Config) -> None:
             break
     else:
         raise RuntimeError("No encontré el botón de confirmación.")
+
+    # Paso de verificación: el sitio puede pedir un OTP que llega por email
+    page.wait_for_timeout(2_500)
+    manejar_otp(page, cfg)
 
     # A veces aparece un modal final de confirmación ("Sei sicuro?" / OK)
     page.wait_for_timeout(2_000)
