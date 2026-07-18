@@ -73,9 +73,20 @@ SEL = {
         "input[type=radio]:not([disabled])",
     ],
     "privacy_check": "#PrivacyCheck, input[name='PrivacyCheck'], input[type=checkbox][id*='rivacy']",
+    # Botón AVANZAR del formulario (pasa a la página del calendario)
+    "avanzar": [
+        "button:has-text('AVANZAR')",
+        "button:has-text('Avanzar')",
+        "button:has-text('Avanti')",
+        "button:has-text('Forward')",
+        "input[type=submit][value*='vanz' i]",
+        "#btnAvanti",
+    ],
     # Campo del código OTP que llega por email al confirmar la reserva
     "otp_input": "input[name*='otp' i], input[id*='otp' i], input[name*='codice' i], input[id*='codice' i]",
     "confirmar": [
+        "button:has-text('PRENOTA')",
+        "button:has-text('Prenota')",
         "#btnPrenotaNoOtp",
         "button#btnPrenota",
         "button[type=submit].button.primary",
@@ -108,9 +119,13 @@ def normalizar(texto: str) -> str:
     return texto
 
 
-def cargar_datos_csv(ruta: str) -> dict[str, str]:
-    """CSV con columnas campo,valor -> dict {etiqueta_normalizada: valor}."""
+def cargar_datos_csv(ruta: str) -> tuple[dict[str, str], dict[str, str]]:
+    """CSV con columnas campo,valor.
+
+    Devuelve ({etiqueta_normalizada: valor}, {etiqueta_normalizada: texto_original}).
+    """
     datos: dict[str, str] = {}
+    originales: dict[str, str] = {}
     with open(ruta, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         columnas = {normalizar(c): c for c in (reader.fieldnames or [])}
@@ -124,9 +139,10 @@ def cargar_datos_csv(ruta: str) -> dict[str, str]:
             valor = (fila[columnas["valor"]] or "").strip()
             if campo:
                 datos[normalizar(campo)] = valor
+                originales[normalizar(campo)] = campo
     if not datos:
         raise SystemExit(f"El CSV '{ruta}' no tiene filas con datos.")
-    return datos
+    return datos, originales
 
 
 class Config:
@@ -243,14 +259,100 @@ def hay_disponibilidad(page: Page, cfg: Config) -> bool:
     return True
 
 
-def llenar_formulario(page: Page, cfg: Config, datos: dict[str, str]) -> None:
+def _usable(loc) -> bool:
+    if not loc.count():
+        return False
+    primero = loc.first
+    # input[type=file] y select suelen estar ocultos tras controles estilizados
+    # (el sitio usa bootstrap-select, que esconde el <select> real)
+    tag = (primero.evaluate("el => el.tagName") or "").lower()
+    es_file = (primero.get_attribute("type") or "").lower() == "file"
+    return es_file or tag == "select" or primero.is_visible()
+
+
+def _completar_control(page: Page, control, valor: str, texto: str) -> bool:
+    """Completa un input/select/textarea según su tipo. True si lo logró."""
+    tag = (control.evaluate("el => el.tagName") or "").lower()
+    tipo = (control.get_attribute("type") or "").lower()
+
+    try:
+        if tipo == "file":
+            # El valor del CSV debe ser la ruta a un archivo (Prenot@Mi
+            # solo acepta PDF, no imágenes)
+            ruta = Path(valor).expanduser()
+            if not ruta.exists():
+                log(f"  ! Archivo no encontrado para '{texto}': {ruta}")
+                return False
+            if ruta.suffix.lower() != ".pdf":
+                log(f"  ! Aviso: Prenot@Mi solo acepta PDF y '{ruta.name}' no lo es.")
+            control.set_input_files(str(ruta))
+        elif tag == "select":
+            # Por texto visible de la opción; si no, por value; si el select
+            # está oculto por bootstrap-select, directo por JS + evento change
+            try:
+                control.select_option(label=valor)
+            except Exception:
+                try:
+                    control.select_option(value=valor)
+                except Exception:
+                    control.evaluate(
+                        """(el, val) => {
+                            const buscado = val.trim().toLowerCase();
+                            for (const o of el.options) {
+                                if (o.text.trim().toLowerCase().includes(buscado)
+                                    || o.value === val) {
+                                    el.value = o.value;
+                                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                                    return;
+                                }
+                            }
+                            throw new Error('opcion no encontrada: ' + val);
+                        }""",
+                        valor,
+                    )
+        elif tipo == "checkbox":
+            if valor.lower() in ("si", "sí", "yes", "true", "1", "x"):
+                control.check()
+        elif tipo == "radio":
+            # Buscar el radio del grupo cuya etiqueta coincida con el valor
+            name = control.get_attribute("name") or ""
+            grupo = page.locator(f"input[type=radio][name='{name}']")
+            marcado = False
+            for j in range(grupo.count()):
+                r = grupo.nth(j)
+                rid = r.get_attribute("id")
+                if rid:
+                    et = page.locator(f"label[for='{rid}']")
+                    if et.count() and normalizar(valor) in normalizar(et.first.inner_text()):
+                        r.check()
+                        marcado = True
+                        break
+            if not marcado:
+                control.check()
+        else:
+            control.click()
+            control.fill("")
+            page.keyboard.type(valor, delay=random.randint(25, 60))
+        log(f"  ✓ '{texto}' <- '{valor}'")
+        return True
+    except Exception as e:
+        log(f"  ! Error completando '{texto}': {e}")
+        return False
+
+
+def llenar_formulario(
+    page: Page, cfg: Config, datos: dict[str, str], originales: dict[str, str]
+) -> None:
     """
-    Completa cada campo buscándolo por el texto de su <label>.
+    Completa cada campo buscándolo por el texto de su <label> y, si no hay
+    label (p.ej. 'Notas para la Sede' es un título con el textarea debajo),
+    por cualquier encabezado/texto visible que coincida con la clave del CSV.
     Robusto ante cambios de posición/orden de los inputs.
     """
-    labels = page.locator("label")
     usados: set[str] = set()
 
+    # --- Pase 1: por <label> ---
+    labels = page.locator("label")
     for i in range(labels.count()):
         label = labels.nth(i)
         try:
@@ -266,6 +368,8 @@ def llenar_formulario(page: Page, cfg: Config, datos: dict[str, str]) -> None:
         valor = None
         clave_usada = None
         for clave, v in datos.items():
+            if clave in usados:
+                continue
             if clave == texto or clave in texto or texto in clave:
                 valor, clave_usada = v, clave
                 break
@@ -273,16 +377,9 @@ def llenar_formulario(page: Page, cfg: Config, datos: dict[str, str]) -> None:
             continue
 
         # Localizar el control asociado: por atributo for, o el siguiente
-        # input/select/textarea dentro del mismo contenedor.
+        # input/select/textarea del DOM.
         control = None
         for_attr = label.get_attribute("for")
-        def _usable(loc) -> bool:
-            if not loc.count():
-                return False
-            # Los input[type=file] suelen estar ocultos tras botones estilizados
-            es_file = (loc.first.get_attribute("type") or "").lower() == "file"
-            return es_file or loc.first.is_visible()
-
         if for_attr:
             id_escapado = re.sub(r"([^a-zA-Z0-9_-])", r"\\\1", for_attr)
             candidato = page.locator(f"#{id_escapado}")
@@ -298,61 +395,86 @@ def llenar_formulario(page: Page, cfg: Config, datos: dict[str, str]) -> None:
             log(f"  ! No encontré el control para la etiqueta '{texto}'")
             continue
 
-        tag = (control.evaluate("el => el.tagName") or "").lower()
-        tipo = (control.get_attribute("type") or "").lower()
-
-        try:
-            if tipo == "file":
-                # El valor del CSV debe ser la ruta a un archivo (Prenot@Mi
-                # solo acepta PDF, no imágenes)
-                ruta = Path(valor).expanduser()
-                if not ruta.exists():
-                    log(f"  ! Archivo no encontrado para '{texto}': {ruta}")
-                    continue
-                if ruta.suffix.lower() != ".pdf":
-                    log(f"  ! Aviso: Prenot@Mi solo acepta PDF y '{ruta.name}' no lo es.")
-                control.set_input_files(str(ruta))
-            elif tag == "select":
-                # Intentar por texto visible de la opción; si no, por value
-                try:
-                    control.select_option(label=valor)
-                except Exception:
-                    control.select_option(value=valor)
-            elif tipo == "checkbox":
-                if valor.lower() in ("si", "sí", "yes", "true", "1", "x"):
-                    control.check()
-            elif tipo == "radio":
-                # Buscar el radio del grupo cuya etiqueta coincida con el valor
-                name = control.get_attribute("name") or ""
-                grupo = page.locator(f"input[type=radio][name='{name}']")
-                marcado = False
-                for j in range(grupo.count()):
-                    r = grupo.nth(j)
-                    rid = r.get_attribute("id")
-                    if rid:
-                        et = page.locator(f"label[for='{rid}']")
-                        if et.count() and normalizar(valor) in normalizar(et.first.inner_text()):
-                            r.check()
-                            marcado = True
-                            break
-                if not marcado:
-                    control.check()
-            else:
-                control.click()
-                control.fill("")
-                page.keyboard.type(valor, delay=random.randint(25, 60))
+        if _completar_control(page, control, valor, texto):
             usados.add(clave_usada)
-            log(f"  ✓ '{texto}' <- '{valor}'")
-        except Exception as e:
-            log(f"  ! Error completando '{texto}': {e}")
+
+    # --- Pase 2: claves sin usar, por encabezado/texto cercano ---
+    for clave in sorted(set(datos) - usados):
+        original = originales.get(clave, clave)
+        try:
+            encabezado = page.get_by_text(
+                re.compile(re.escape(original), re.IGNORECASE)
+            ).first
+            if not encabezado.count() or not encabezado.is_visible():
+                continue
+            candidato = encabezado.locator(
+                "xpath=following::*[self::input or self::select or self::textarea][1]"
+            )
+            if _usable(candidato) and _completar_control(
+                page, candidato.first, datos[clave], original
+            ):
+                usados.add(clave)
+        except Exception:
+            continue
 
     sin_usar = set(datos) - usados
     if sin_usar:
         log(f"  Aviso: campos del CSV que no aparecieron en el formulario: {sorted(sin_usar)}")
 
 
+def marcar_privacidad(page: Page) -> None:
+    privacy = page.locator(SEL["privacy_check"])
+    if privacy.count():
+        try:
+            privacy.first.check()
+            log("Checkbox de privacidad marcado.")
+        except Exception as e:
+            log(f"No pude marcar privacidad: {e}")
+
+
+def avanzar_al_calendario(page: Page, cfg: Config) -> None:
+    """Click en AVANZAR: pasa del formulario a la página del calendario."""
+    for sel in SEL["avanzar"]:
+        btn = page.locator(sel)
+        if btn.count() and btn.first.is_visible():
+            btn.first.click()
+            log("Click en AVANZAR.")
+            page.wait_for_load_state("domcontentloaded", timeout=30_000)
+            page.wait_for_timeout(2_000)
+            screenshot(page, cfg, "04c-calendario")
+            return
+    log("No encontré botón AVANZAR (puede que el calendario esté en la misma página).")
+
+
+def _click_dia_verde_por_color(page: Page) -> bool:
+    """Fallback: clickea la primera celda numérica del calendario cuyo fondo
+    computado sea verde (la leyenda del sitio: verde = Disponible)."""
+    return bool(
+        page.evaluate(
+            r"""() => {
+                const esVerde = (color) => {
+                    const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                    if (!m) return false;
+                    const [r, g, b] = [ +m[1], +m[2], +m[3] ];
+                    return g > 90 && g > r + 30 && g > b + 30;
+                };
+                const celdas = document.querySelectorAll(
+                    'table td, table td a, table td button, table td div');
+                for (const el of celdas) {
+                    if (!/^\d{1,2}$/.test(el.textContent.trim())) continue;
+                    if (esVerde(getComputedStyle(el).backgroundColor)) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }"""
+        )
+    )
+
+
 def elegir_primer_dia(page: Page, cfg: Config) -> bool:
-    """Busca el primer día disponible, avanzando de mes hasta MAX_MESES."""
+    """Busca el primer día verde (disponible), avanzando de mes hasta MAX_MESES."""
     for mes in range(cfg.max_meses):
         for sel in SEL["dias_disponibles"]:
             dias = page.locator(sel)
@@ -365,9 +487,15 @@ def elegir_primer_dia(page: Page, cfg: Config) -> bool:
                 log(f"Día disponible seleccionado (selector '{sel}', mes +{mes}).")
                 page.wait_for_timeout(1_500)
                 return True
+        # Fallback por color de fondo (verde = disponible según la leyenda)
+        if _click_dia_verde_por_color(page):
+            log(f"Día disponible seleccionado por color verde (mes +{mes}).")
+            page.wait_for_timeout(1_500)
+            return True
         # Sin días este mes: intentar pasar al siguiente
         avanzo = False
-        for sel in SEL["mes_siguiente"]:
+        for sel in SEL["mes_siguiente"] + ["a:text-is('>')", "button:text-is('>')",
+                                           "th:text-is('>')", "td:text-is('>')"]:
             btn = page.locator(sel)
             if btn.count() and btn.first.is_visible():
                 btn.first.click()
@@ -380,6 +508,17 @@ def elegir_primer_dia(page: Page, cfg: Config) -> bool:
 
 
 def elegir_primer_horario(page: Page) -> bool:
+    # Las fascias horarias son botones con texto tipo "08:00 - 09:00 (2)"
+    patron_hora = re.compile(r"\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}")
+    try:
+        fascia = page.get_by_text(patron_hora).first
+        if fascia.count() and fascia.is_visible():
+            fascia.click()
+            log(f"Fascia horaria seleccionada: {fascia.inner_text().strip()[:30]}")
+            page.wait_for_timeout(800)
+            return True
+    except Exception:
+        pass
     for sel in SEL["slots_horario"]:
         slots = page.locator(sel)
         try:
@@ -395,7 +534,7 @@ def elegir_primer_horario(page: Page) -> bool:
                     return True
             except Exception:
                 continue
-    # Muchos servicios de ciudadanía no tienen elección de horario: no es error
+    # Algunos servicios tienen una sola fascia y no exigen elegirla: no es error
     log("No se encontró selector de horario (puede que el servicio no lo requiera).")
     return False
 
@@ -485,14 +624,7 @@ def manejar_otp(page: Page, cfg: Config) -> None:
 
 
 def confirmar(page: Page, cfg: Config) -> None:
-    privacy = page.locator(SEL["privacy_check"])
-    if privacy.count():
-        try:
-            privacy.first.check()
-            log("Checkbox de privacidad marcado.")
-        except Exception as e:
-            log(f"No pude marcar privacidad: {e}")
-
+    """Click en PRENOTA en la página del calendario, luego OTP y modal final."""
     screenshot(page, cfg, "05-antes-de-confirmar")
     for sel in SEL["confirmar"]:
         btn = page.locator(sel)
@@ -521,7 +653,7 @@ def confirmar(page: Page, cfg: Config) -> None:
 
 def main() -> None:
     cfg = Config()
-    datos = cargar_datos_csv(cfg.csv_datos)
+    datos, originales = cargar_datos_csv(cfg.csv_datos)
     log(f"Datos cargados del CSV ({len(datos)} campos).")
 
     with sync_playwright() as pw:
@@ -568,9 +700,13 @@ def main() -> None:
                     log("Sesión expirada: relogueando...")
                     login(page, cfg)
 
-            llenar_formulario(page, cfg, datos)
+            # Página 1: formulario (tipo de reserva, notas, privacidad) + AVANZAR
+            llenar_formulario(page, cfg, datos, originales)
+            marcar_privacidad(page)
             screenshot(page, cfg, "04-formulario-completo")
+            avanzar_al_calendario(page, cfg)
 
+            # Página 2: calendario (verde = disponible) + fascia horaria + PRENOTA
             if not elegir_primer_dia(page, cfg):
                 log("No encontré días disponibles en el calendario "
                     "(pueden haberse agotado mientras completábamos el formulario).")

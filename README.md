@@ -58,17 +58,22 @@ Numero di persone,1
 
 ## El flujo real de reserva (y cómo lo cubre el bot)
 
-Según la documentación pública del sistema, al reservar ciudadanía el flujo es:
+Flujo verificado con capturas reales del servicio de Ciudadanía:
 
-1. **Tipo de reserva** (individual / múltiple) y formulario de datos
-   → el bot lo completa desde `datos.csv` (fila `Tipo de reserva,Individual`).
-2. **Subida de documentos** — Prenot@Mi solo acepta **PDF** (no JPG/PNG)
-   → si una fila del CSV apunta a una ruta de archivo, el bot lo sube.
-3. **Calendario**: días **verdes** = disponibles, rojos = no; al elegir día se
-   abre la lista de horarios al costado → el bot toma el primero de ambos.
-4. **Código OTP**: al confirmar, llega un código numérico por email que hay
-   que ingresar para finalizar → ver sección siguiente.
-5. Email final de confirmación con los datos del turno.
+1. **Página de formulario**: "Tipo de reserva" (desplegable, p.ej. *Reserva
+   unica*), "Notas para la Sede" (texto libre), checkbox de privacidad y botón
+   **AVANZAR** → el bot completa todo desde `datos.csv`, marca privacidad y
+   avanza. Si el formulario pide subir documentos, Prenot@Mi solo acepta
+   **PDF**: una fila del CSV con una ruta de archivo hace que el bot lo suba.
+2. **Página de calendario**: "Selezionare una data e una fascia oraria
+   disponibile" — días **verdes** = disponibles, rojos = no, azul =
+   seleccionado; al elegir día aparecen las fascias horarias al costado
+   (p.ej. `08:00 - 09:00 (2)`) y el botón **PRENOTA** → el bot elige el primer
+   día verde (detectándolo por clase CSS o directamente por el color de fondo),
+   la primera fascia horaria y confirma.
+3. **Código OTP**: al confirmar puede llegar un código numérico por email que
+   hay que ingresar para finalizar → ver sección siguiente.
+4. Email final de confirmación con los datos del turno.
 
 ### OTP automático
 
